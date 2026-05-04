@@ -179,7 +179,7 @@
 
     - name: "Create Python virtual environment"
       shell: |
-        {{ python_version }} -m venv {{ app_dir }}/venv
+        /usr/bin/python3.11 -m venv {{ app_dir }}/venv
       args:
         creates: "{{ app_dir }}/venv/bin/activate"
       become: yes
