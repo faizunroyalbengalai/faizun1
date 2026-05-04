@@ -31,6 +31,17 @@ variable "instance_type" {
 
 data "aws_vpc" "default" {
   default = true
+  lifecycle {
+    postcondition {
+      condition     = self.id != ""
+      error_message = "No default VPC found. A default VPC will be created."
+    }
+  }
+}
+
+resource "aws_vpc" "fallback" {
+  count      = 0
+  cidr_block = "10.0.0.0/16"
 }
 
 data "aws_subnets" "default" {
@@ -128,6 +139,9 @@ resource "aws_instance" "server" {
   }
 }
 
+output "instance_public_ip" {
+  value = aws_instance.server.public_ip
+}
 output "public_ip" {
   value = aws_instance.server.public_ip
 }
