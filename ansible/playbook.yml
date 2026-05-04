@@ -18,6 +18,10 @@
       apt:
         update_cache: yes
         cache_valid_time: 3600
+      retries: 5
+      delay: 10
+      register: apt_update_result
+      until: apt_update_result is succeeded
 
     - name: "Install system packages"
       apt:
@@ -198,94 +202,3 @@
         {{ app_dir }}/venv/bin/pip install gunicorn uvicorn
       become: yes
       become_user: "{{ app_user }}"
-
-    - name: "Create systemd service for python-flask"
-      copy:
-        dest: /etc/systemd/system/python-flask.service
-        content: |
-          [Unit]
-          Description=python-flask application
-          After=network.target
-
-          [Service]
-          Type=simple
-          User={{ app_user }}
-          WorkingDirectory={{ app_dir }}
-          EnvironmentFile={{ app_dir }}/.env
-          ExecStart={{ app_dir }}/venv/bin/gunicorn {{ entrypoint }} -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:{{ app_port }}
-          Restart=always
-          RestartSec=5
-
-          [Install]
-          WantedBy=multi-user.target
-
-    - name: "Reload systemd daemon"
-      systemd:
-        daemon_reload: yes
-
-    - name: "Enable and start python-flask service"
-      systemd:
-        name: python-flask
-        state: restarted
-        enabled: yes
-
-    - name: "Configure nginx reverse proxy"
-      copy:
-        dest: /etc/nginx/sites-available/python-flask
-        content: |
-          server {
-              listen {{ nginx_port }};
-              server_name _;
-
-              location / {
-                  proxy_pass http://127.0.0.1:{{ app_port }};
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-                  proxy_read_timeout 60s;
-                  proxy_connect_timeout 60s;
-              }
-          }
-
-    - name: "Enable nginx site"
-      file:
-        src: /etc/nginx/sites-available/python-flask
-        dest: /etc/nginx/sites-enabled/python-flask
-        state: link
-
-    - name: "Remove nginx default site"
-      file:
-        path: /etc/nginx/sites-enabled/default
-        state: absent
-
-    - name: "Test nginx configuration"
-      command: nginx -t
-
-    - name: "Restart nginx"
-      systemd:
-        name: nginx
-        state: restarted
-        enabled: yes
-
-    - name: "Wait for app to be ready on port 8000"
-      wait_for:
-        host: 127.0.0.1
-        port: "{{ app_port }}"
-        timeout: 120
-        delay: 10
-      register: wait_result
-      ignore_errors: yes
-
-    - name: "Show journalctl logs on failure"
-      command: journalctl -u python-flask -n 50 --no-pager
-      when: wait_result is failed
-
-    - name: "Fail if app did not start"
-      fail:
-        msg: "Application failed to start on port {{ app_port }}"
-      when: wait_result is failed
-
-    - name: "Print server info"
-      debug:
-        msg: "server_ip={{ ansible_host }}"
