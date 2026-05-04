@@ -1,0 +1,291 @@
+---
+- name: Deploy python-flask on EC2
+  hosts: all
+  become: yes
+
+  vars:
+    app_dir: /opt/app
+    app_user: ubuntu
+    app_port: 8000
+    nginx_port: 80
+    python_version: python3.11
+    entrypoint: "app.main:app"
+    repo_dir: "{{ playbook_dir }}/.."
+
+  tasks:
+
+    - name: "Update apt cache"
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: "Install system packages"
+      apt:
+        name:
+          - python3.11
+          - python3.11-venv
+          - python3-pip
+          - nginx
+          - git
+          - curl
+        state: present
+
+    - name: "Install PostgreSQL"
+      apt:
+        name: postgresql
+        state: present
+      when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
+
+    - name: "Fix PostgreSQL SCRAM auth to md5"
+      shell: |
+        HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
+        sed -i 's/scram-sha-256/md5/g' "$HBA"
+        systemctl reload postgresql
+      when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
+
+    - name: "Create PostgreSQL database"
+      shell: |
+        sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};" || true
+      when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
+
+    - name: "Create PostgreSQL user"
+      shell: |
+        sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password }}';" || true
+      when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
+
+    - name: "Grant PostgreSQL privileges"
+      shell: |
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};" || true
+      when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
+
+    - name: "Install MySQL"
+      apt:
+        name: mysql-server
+        state: present
+      when: install_db | default('') == 'true' and db_type | default('') == 'mysql'
+
+    - name: "Configure MySQL database and user"
+      shell: |
+        mysql -e "CREATE DATABASE IF NOT EXISTS {{ db_name }};"
+        mysql -e "CREATE USER IF NOT EXISTS '{{ db_username }}'@'localhost' IDENTIFIED BY '{{ db_password }}';"
+        mysql -e "GRANT ALL ON {{ db_name }}.* TO '{{ db_username }}'@'localhost';"
+      when: install_db | default('') == 'true' and db_type | default('') == 'mysql'
+
+    - name: "Install MongoDB dependencies"
+      apt:
+        name:
+          - gnupg
+          - curl
+        state: present
+      when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
+
+    - name: "Install MongoDB"
+      apt:
+        name: mongodb-org
+        state: present
+      when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
+
+    - name: "Start and enable MongoDB"
+      systemd:
+        name: mongod
+        state: started
+        enabled: yes
+      when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
+
+    - name: "Init MongoDB collection"
+      shell: |
+        mongosh --eval 'db.getSiblingDB("{{ db_name }}").createCollection("init")' || true
+      when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
+
+    - name: "Create app directory"
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+
+    - name: "Check if git repo exists"
+      stat:
+        path: "{{ app_dir }}/.git"
+      register: git_repo
+
+    - name: "Clone repository"
+      git:
+        repo: "{{ lookup('env', 'REPO_URL') | default('') }}"
+        dest: "{{ app_dir }}"
+        version: HEAD
+        force: yes
+      become: yes
+      become_user: "{{ app_user }}"
+      when: not git_repo.stat.exists and lookup('env', 'REPO_URL') != ''
+
+    - name: "Copy application files from runner"
+      synchronize:
+        src: "{{ repo_dir }}/"
+        dest: "{{ app_dir }}/"
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=ansible"
+          - "--exclude=terraform"
+      when: lookup('env', 'REPO_URL') == ''
+
+    - name: "Set app directory ownership"
+      file:
+        path: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: yes
+
+    - name: "Check index.html in repo"
+      stat:
+        path: "{{ playbook_dir }}/../index.html"
+      delegate_to: localhost
+      register: idx
+
+    - name: "Deploy index.html from repo"
+      copy:
+        src: "{{ playbook_dir }}/../index.html"
+        dest: "{{ app_dir }}/index.html"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+      when: idx.stat.exists
+
+    - name: "Deploy default index.html"
+      copy:
+        content: "<html><body><h1>python-flask</h1></body></html>"
+        dest: "{{ app_dir }}/index.html"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+      when: not idx.stat.exists
+
+    - name: "Write .env file"
+      shell: |
+        printf '' > {{ app_dir }}/.env
+        [ -n "{{ database_url | default('') }}" ] && echo "DATABASE_URL={{ database_url }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ mongo_uri | default('') }}" ] && echo "MONGO_URI={{ mongo_uri }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_host | default('') }}" ] && echo "DB_HOST={{ db_host }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_port | default('') }}" ] && echo "DB_PORT={{ db_port }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_name | default('') }}" ] && echo "DB_NAME={{ db_name }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_user | default('') }}" ] && echo "DB_USER={{ db_user }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_username | default('') }}" ] && echo "DB_USERNAME={{ db_username }}" >> {{ app_dir }}/.env || true
+        [ -n "{{ db_password | default('') }}" ] && echo "DB_PASSWORD={{ db_password }}" >> {{ app_dir }}/.env || true
+        chown {{ app_user }}:{{ app_user }} {{ app_dir }}/.env
+        chmod 600 {{ app_dir }}/.env
+
+    - name: "Create Python virtual environment"
+      shell: |
+        {{ python_version }} -m venv {{ app_dir }}/venv
+      args:
+        creates: "{{ app_dir }}/venv/bin/activate"
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: "Upgrade pip in venv"
+      shell: |
+        {{ app_dir }}/venv/bin/pip install --upgrade pip
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: "Install Python requirements"
+      shell: |
+        {{ app_dir }}/venv/bin/pip install -r {{ app_dir }}/requirements.txt
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: "Install gunicorn and uvicorn in venv"
+      shell: |
+        {{ app_dir }}/venv/bin/pip install gunicorn uvicorn
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: "Create systemd service for python-flask"
+      copy:
+        dest: /etc/systemd/system/python-flask.service
+        content: |
+          [Unit]
+          Description=python-flask application
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ app_dir }}/venv/bin/gunicorn {{ entrypoint }} -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:{{ app_port }}
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: "Reload systemd daemon"
+      systemd:
+        daemon_reload: yes
+
+    - name: "Enable and start python-flask service"
+      systemd:
+        name: python-flask
+        state: restarted
+        enabled: yes
+
+    - name: "Configure nginx reverse proxy"
+      copy:
+        dest: /etc/nginx/sites-available/python-flask
+        content: |
+          server {
+              listen {{ nginx_port }};
+              server_name _;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 60s;
+                  proxy_connect_timeout 60s;
+              }
+          }
+
+    - name: "Enable nginx site"
+      file:
+        src: /etc/nginx/sites-available/python-flask
+        dest: /etc/nginx/sites-enabled/python-flask
+        state: link
+
+    - name: "Remove nginx default site"
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: "Test nginx configuration"
+      command: nginx -t
+
+    - name: "Restart nginx"
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+    - name: "Wait for app to be ready on port 8000"
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        timeout: 120
+        delay: 10
+      register: wait_result
+      ignore_errors: yes
+
+    - name: "Show journalctl logs on failure"
+      command: journalctl -u python-flask -n 50 --no-pager
+      when: wait_result is failed
+
+    - name: "Fail if app did not start"
+      fail:
+        msg: "Application failed to start on port {{ app_port }}"
+      when: wait_result is failed
+
+    - name: "Print server info"
+      debug:
+        msg: "server_ip={{ ansible_host }}"
