@@ -37,6 +37,16 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
           chmod 600 /tmp/deploy_key
 
+      - name: Restore default VPC if missing
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+          if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+            echo "No default VPC found. Creating one..."
+            aws ec2 create-default-vpc
+          else
+            echo "Default VPC exists: $VPC_ID"
+          fi
+
       - name: Terraform Init
         working-directory: terraform
         run: |
